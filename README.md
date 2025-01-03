@@ -74,3 +74,9 @@ Before using the scripts in this repository, ensure that you have the following 
 - For more information about the WhisperX ASR model, refer to the official documentation or repository of the model.
 
 - This readme was generated with GPT model, any fixes are more than welcome 😃
+
+## Extra 
+
+For dll use 8.x https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/
+
+get torch here https://pytorch.org/get-started/previous-versions/
