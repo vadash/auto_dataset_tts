@@ -19,7 +19,7 @@ language = "en"
 target_sampling_rate = 44100  # Default and most popular WAV format sampling rate
 
 # Model Initialization
-model = whisperx.load_model("large-v2", device, compute_type=compute_type, language=language)
+model = whisperx.load_model("small.en", device, compute_type=compute_type, language=language)
 model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
 
 # Run Management
@@ -106,10 +106,15 @@ def process_segments(result):
 
     return refined_segments
 
-def cut_sample_to_speech_only(audio_path: str) -> str:
+import librosa
+import numpy as np
+import soundfile as sf
+
+def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str:
     """
     Transcribes an audio sample, finds the end of the last speech segment,
     and trims the audio to that point to remove trailing silence or noise.
+    Uses adaptive silence thresholding and smoothed energy for improved accuracy.
     """
     try:
         audio_sample = whisperx.load_audio(audio_path)
@@ -124,18 +129,39 @@ def cut_sample_to_speech_only(audio_path: str) -> str:
 
         # Refine end time based on silence detection
         audio, sr = librosa.load(audio_path, sr=target_sampling_rate)
-        amplitude_db = librosa.amplitude_to_db(np.abs(librosa.stft(audio)), ref=np.max)
-        window_size_sec = 0.10
-        silence_threshold_db = -40  # Default audiobook silence threshold
-        window_size_samples = int(window_size_sec * sr)
-        start_frame = int(end * sr)
-        audio_windows = [amplitude_db[:, x:x + window_size_samples].max() for x in range(start_frame, amplitude_db.shape[1], window_size_samples)]
 
-        for window in audio_windows:
-            if window > silence_threshold_db:
-                end += window_size_sec
+        # Calculate energy
+        frame_length = int(0.025 * sr)  # 25 ms frame length
+        hop_length = int(0.01 * sr)  # 10 ms hop length
+        rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+
+        # Smooth energy with a moving average
+        window_size = 5  # Smoothing window size (adjust as needed)
+        smoothed_rms = np.convolve(rms, np.ones(window_size)/window_size, mode='same')
+
+        # Adaptive thresholding
+        median_rms = np.median(smoothed_rms)
+        std_rms = np.std(smoothed_rms)
+        silence_threshold_high = median_rms + std_rms  # Adjust multiplier as needed
+        silence_threshold_low = median_rms + 0.5 * std_rms # Adjust multiplier as needed
+
+        # Hysteresis thresholding and minimum silence duration
+        min_silence_duration = 0.2  # Minimum silence duration in seconds
+        min_silence_frames = int(min_silence_duration / (hop_length / sr))
+
+        end_frame = int(end / (hop_length / sr))
+        silence_frames = 0
+
+        for i in range(end_frame, len(smoothed_rms)):
+            if smoothed_rms[i] < silence_threshold_high:
+                silence_frames += 1
             else:
-                break
+                silence_frames = 0
+
+            if silence_frames >= min_silence_frames:
+                if all(smoothed_rms[i - j] < silence_threshold_low for j in range(min_silence_frames)):
+                    end = (i - min_silence_frames) * (hop_length / sr)
+                    break
 
         # Save the trimmed audio
         sf.write(audio_path, audio[:int(end * sr)], sr)
@@ -163,7 +189,7 @@ def cut_and_save_audio(input_audio_path: str, segments: List[dict]) -> List[Segm
         output_path = os.path.join(output_dir_name, f"{output_prefix}_{idx + 1}.wav")
         sf.write(output_path, audio_segment, target_sampling_rate)
 
-        segment_text = cut_sample_to_speech_only(output_path)
+        segment_text = cut_sample_to_speech_only(output_path, target_sampling_rate) # Pass target_sampling_rate
         if segment_text:
             outputs.append(Segment(
                 text=segment_text,
