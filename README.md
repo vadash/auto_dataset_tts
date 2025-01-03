@@ -80,3 +80,6 @@ Before using the scripts in this repository, ensure that you have the following 
 For dll use 8.x https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-x86_64/
 
 get torch here https://pytorch.org/get-started/previous-versions/
+
+Python 3.10 @ WSL2
+https://gist.github.com/rutcreate/c0041e842f858ceb455b748809763ddb
