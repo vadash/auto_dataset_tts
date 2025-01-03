@@ -1,45 +1,88 @@
 import glob
 import os
-from dataclasses import dataclass
-from datetime import datetime
-from typing import List
-
+import randomname
 import librosa
 import numpy as np
-import randomname
 import soundfile as sf
 import whisperx
+from dataclasses import dataclass
+from datetime import datetime
 from tqdm import tqdm
+from typing import List
+import logging
+import torch
 
-# Configuration
-device = "cuda"
-batch_size = 8  # Use 8 for 8 GB VRAM
-compute_type = "float16"  # float16 / int8
-language = "en"
-target_sampling_rate = 44100  # Default and most popular WAV format sampling rate
+# --- Constants ---
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # Device for model execution
+BATCH_SIZE = 16  # Batch size for processing (adjust based on VRAM)
+COMPUTE_TYPE = "int8"  # Computation type (float16 or int8)
+LANGUAGE = "en"  # Language for transcription
+TARGET_SAMPLING_RATE = 48000  # Target sampling rate for audio
+LONG_CHAR_THRESHOLD = 0.5  # Threshold to identify long pauses in speech
+FRAME_LENGTH_MS = 25  # Frame length in milliseconds for energy calculation
+HOP_LENGTH_MS = 10  # Hop length in milliseconds for energy calculation
+SMOOTHING_WINDOW_SIZE = 5  # Window size for smoothing energy
+STD_RMS_MULTIPLIER_HIGH = 1.0  # Multiplier for standard deviation of RMS energy for high threshold
+STD_RMS_MULTIPLIER_LOW = 0.5  # Multiplier for standard deviation of RMS energy for low threshold
+MIN_SILENCE_DURATION = 0.25  # Minimum silence duration in seconds
+TRAIN_VALIDATION_SPLIT = 0.95  # Percentage of data to use for training
+# RVC use 2,2,5. XTTS use 5,8,12
+MIN_SEGMENT_DURATION = 2  # Minimum duration of a segment in seconds
+OPTIMAL_SEGMENT_DURATION = 2  # Optimal duration of a segment in seconds
+MAX_SEGMENT_DURATION = 5  # Maximum duration of a segment in seconds
 
-# Model Initialization
-model = whisperx.load_model("small.en", device, compute_type=compute_type, language=language)
-model_a, metadata = whisperx.load_align_model(language_code=language, device=device)
+# --- Logging Setup ---
+# Create a logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Set the minimum logging level
 
-# Run Management
+# Create a file handler to write logs to a file
+log_file = 'audio_processing.log'
+file_handler = logging.FileHandler(log_file)
+file_handler.setLevel(logging.DEBUG)  # Set the minimum logging level for the file handler
+
+# Create a console handler to output logs to the console
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)  # Set the minimum logging level for the console handler
+
+# Create a formatter and set it for both handlers
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Add the handlers to the logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# --- Model Initialization ---
+logger.info("Initializing WhisperX and Alignment models...")
+try:
+    model = whisperx.load_model("small.en", DEVICE, compute_type=COMPUTE_TYPE, language=LANGUAGE)
+    model_a, metadata = whisperx.load_align_model(language_code=LANGUAGE, device=DEVICE)
+    logger.info("WhisperX and Alignment models initialized successfully.")
+except Exception as e:
+    logger.error(f"Failed to initialize models: {e}")
+    raise
+
+# --- Run Management ---
 def get_run_name() -> str:
     """Generate a unique run name using the current timestamp and a random name."""
     run_name = datetime.now().strftime("%Y_%m_%d_%H_%M") + f"_{randomname.get_name()}"
-    print(f"Starting a new run: {run_name}")
+    logger.info(f"Starting a new run: {run_name}")
     return run_name
 
 run_name = get_run_name()
 output_dir = os.path.join('output_audio_segments', run_name)
 os.makedirs(output_dir, exist_ok=True)
 
-# Track processed files
+# --- Track processed files ---
 files_done_path = os.path.join(output_dir, 'files_done.txt')
 files_done = set()
 if os.path.exists(files_done_path):
     with open(files_done_path, 'r', encoding='utf-8') as f:
         files_done = set(x.strip() for x in f.readlines())
 
+# --- Data Structures ---
 @dataclass
 class Segment:
     """Dataclass to store segment information."""
@@ -47,10 +90,54 @@ class Segment:
     filepath: str
     duration: float
 
-def process_segments(result):
+# --- Dynamic Chunk Size Adjustment ---
+def calculate_dynamic_chunk_size(audio: np.ndarray, sr: int) -> int:
+    """
+    Calculates a dynamic chunk size based on audio characteristics.
+    """
+    # Example: Adjust chunk size based on average silence duration
+    rms = librosa.feature.rms(y=audio, frame_length=int(sr * FRAME_LENGTH_MS / 1000), hop_length=int(sr * HOP_LENGTH_MS / 1000))[0]
+    avg_silence_duration = np.mean(np.diff(np.where(rms < np.mean(rms))[0])) * HOP_LENGTH_MS / 1000
+    dynamic_chunk_size = max(10, min(30, int(avg_silence_duration * 5)))  # Example heuristic
+    logger.debug(f"Dynamic chunk size: {dynamic_chunk_size}")
+    return dynamic_chunk_size
+
+# --- Enhanced Silence Detection ---
+def detect_silence_with_hysteresis(audio: np.ndarray, sr: int, silence_threshold_high: float, silence_threshold_low: float, min_silence_frames: int) -> List[tuple]:
+    """
+    Detects periods of silence in audio using hysteresis thresholding.
+    """
+    rms = librosa.feature.rms(y=audio, frame_length=int(sr * FRAME_LENGTH_MS / 1000), hop_length=int(sr * HOP_LENGTH_MS / 1000))[0]
+    smoothed_rms = np.convolve(rms, np.ones(SMOOTHING_WINDOW_SIZE) / SMOOTHING_WINDOW_SIZE, mode='same')
+
+    silence_starts = []
+    silence_ends = []
+    in_silence = False
+    silence_frame_count = 0
+
+    for i, level in enumerate(smoothed_rms):
+        if level < silence_threshold_high:
+            silence_frame_count += 1
+            if not in_silence and silence_frame_count >= min_silence_frames:
+                in_silence = True
+                silence_starts.append(max(0, i - min_silence_frames))
+        else:
+            if in_silence and all(smoothed_rms[i - j] < silence_threshold_low for j in range(min_silence_frames)):
+                in_silence = False
+                silence_ends.append(i)
+            silence_frame_count = 0
+
+    # Handle the case where the audio ends in silence
+    if in_silence:
+        silence_ends.append(len(smoothed_rms))
+
+    return list(zip(silence_starts, silence_ends))
+
+# --- Segment Processing ---
+def process_segments(result, audio_path, sr):
     """
     Processes and combines segments to meet length requirements while preserving sentence integrity.
-    Returns list of refined segments.
+    Returns a list of refined segments.
     """
     refined_segments = []
     current_segment = {
@@ -59,27 +146,36 @@ def process_segments(result):
         'end': None
     }
 
+    # Calculate silence segments
+    audio = whisperx.load_audio(audio_path)
+    median_rms = np.median(librosa.feature.rms(y=audio, frame_length=int(sr * FRAME_LENGTH_MS / 1000), hop_length=int(sr * HOP_LENGTH_MS / 1000))[0])
+    std_rms = np.std(librosa.feature.rms(y=audio, frame_length=int(sr * FRAME_LENGTH_MS / 1000), hop_length=int(sr * HOP_LENGTH_MS / 1000))[0])
+    silence_threshold_high = median_rms + STD_RMS_MULTIPLIER_HIGH * std_rms
+    silence_threshold_low = median_rms + STD_RMS_MULTIPLIER_LOW * std_rms
+    min_silence_frames = int(MIN_SILENCE_DURATION / (HOP_LENGTH_MS / 1000))
+    silence_segments = detect_silence_with_hysteresis(audio, sr, silence_threshold_high, silence_threshold_low, min_silence_frames)
+
     for segment in result["segments"]:
-        # Initialize start time if this is the beginning of a new segment
         if current_segment['start'] is None:
             current_segment['start'] = segment['start']
 
-        # Calculate current duration
-        segment_duration = segment['end'] - current_segment['start']
+        segment_duration = segment['end'] - segment['start']
         proposed_duration = segment['end'] - current_segment['start']
 
-        # Check if adding this segment would exceed max duration
-        if proposed_duration > 15:
-            if segment_duration >= 3:  # Only save if minimum duration met
+        # Check if adding this segment would exceed the maximum duration
+        if proposed_duration > MAX_SEGMENT_DURATION:
+            # Save the current segment if it meets the minimum duration
+            if current_segment['end'] is not None and current_segment['end'] - current_segment['start'] >= MIN_SEGMENT_DURATION:
                 refined_segments.append(current_segment)
-                current_segment = {
-                    'text': segment['text'],
-                    'start': segment['start'],
-                    'end': segment['end']
-                }
+            # Start a new segment
+            current_segment = {
+                'text': segment['text'],
+                'start': segment['start'],
+                'end': segment['end']
+            }
             continue
 
-        # Add text to current segment
+        # Add text to the current segment
         if current_segment['text']:
             current_segment['text'] += ' ' + segment['text']
         else:
@@ -87,10 +183,20 @@ def process_segments(result):
 
         current_segment['end'] = segment['end']
 
-        # Check if we should close this segment (near optimal length or ends with punctuation)
-        if (segment_duration >= 8 and
-            any(segment['text'].strip().endswith(p) for p in ['.', '!', '?', ':', ';'])):
-            if segment_duration >= 3:  # Only save if minimum duration met
+        # Check if we should close this segment based on silence or punctuation
+        close_segment = False
+        if proposed_duration >= OPTIMAL_SEGMENT_DURATION:
+            # Check for silence at the end of the segment
+            segment_end_frame = int(segment['end'] * sr / (sr * HOP_LENGTH_MS / 1000))
+            if any(start <= segment_end_frame <= end for start, end in silence_segments):
+                close_segment = True
+            # Check for punctuation at the end of the segment
+            elif any(segment['text'].strip().endswith(p) for p in ['.', '!', '?', ':', ';']):
+                close_segment = True
+
+        if close_segment:
+            # Save the current segment if it meets the minimum duration
+            if current_segment['end'] is not None and current_segment['end'] - current_segment['start'] >= MIN_SEGMENT_DURATION:
                 refined_segments.append(current_segment)
                 current_segment = {
                     'text': '',
@@ -98,18 +204,15 @@ def process_segments(result):
                     'end': None
                 }
 
-    # Add the last segment if it meets minimum duration
-    if current_segment['start'] is not None:
+    # Add the last segment if it meets the minimum duration
+    if current_segment['start'] is not None and current_segment['end'] is not None:
         final_duration = current_segment['end'] - current_segment['start']
-        if final_duration >= 3:
+        if final_duration >= MIN_SEGMENT_DURATION:
             refined_segments.append(current_segment)
 
     return refined_segments
 
-import librosa
-import numpy as np
-import soundfile as sf
-
+# --- Audio Trimming ---
 def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str:
     """
     Transcribes an audio sample, finds the end of the last speech segment,
@@ -117,37 +220,41 @@ def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str
     Uses adaptive silence thresholding and smoothed energy for improved accuracy.
     """
     try:
+        logger.debug(f"Processing audio: {audio_path}")
         audio_sample = whisperx.load_audio(audio_path)
-        result_sample = model.transcribe(audio_sample, batch_size=batch_size, chunk_size=30)
-        result_sample = whisperx.align(result_sample["segments"], model_a, metadata, audio_sample, device, return_char_alignments=True)
+        dynamic_chunk_size = calculate_dynamic_chunk_size(audio_sample, target_sampling_rate)
+        result_sample = model.transcribe(audio_sample, batch_size=BATCH_SIZE, chunk_size=dynamic_chunk_size)
+        result_sample = whisperx.align(result_sample["segments"], model_a, metadata, audio_sample, DEVICE, return_char_alignments=True)
 
-        # Find the end of the last speech segment
+        if not result_sample['segments']:
+            logger.warning(f"No speech segments found in {audio_path}.")
+            return ""
+
         segment = result_sample['segments'][-1]
-        chars = [char for char in segment['chars'] if char.get('end')]
-        long_char_threshold = 0.5  # Threshold to identify long pauses
-        end = next((char['end'] for char in reversed(chars) if char.get('char').strip() and (char['end'] - char['start']) < long_char_threshold), chars[-1]['end'])
 
-        # Refine end time based on silence detection
+        if not segment.get('chars'):
+            logger.warning(f"No character alignments found for the last segment in {audio_path}.")
+            end = segment['end']
+        else:
+            chars = [char for char in segment['chars'] if char.get('end') is not None and char.get('start') is not None]
+            if not chars:
+                logger.warning(f"No valid characters with 'end' and 'start' found in {audio_path}.")
+                end = segment['end']
+            else:
+                valid_end_chars = [char['end'] for char in reversed(chars) if char.get('char', '').strip() and (char['end'] - char['start']) < LONG_CHAR_THRESHOLD]
+                end = next(iter(valid_end_chars), chars[-1]['end'])
+
         audio, sr = librosa.load(audio_path, sr=target_sampling_rate)
-
-        # Calculate energy
-        frame_length = int(0.025 * sr)  # 25 ms frame length
-        hop_length = int(0.01 * sr)  # 10 ms hop length
+        frame_length = int(FRAME_LENGTH_MS / 1000 * sr)
+        hop_length = int(HOP_LENGTH_MS / 1000 * sr)
         rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
+        smoothed_rms = np.convolve(rms, np.ones(SMOOTHING_WINDOW_SIZE) / SMOOTHING_WINDOW_SIZE, mode='same')
 
-        # Smooth energy with a moving average
-        window_size = 5  # Smoothing window size (adjust as needed)
-        smoothed_rms = np.convolve(rms, np.ones(window_size)/window_size, mode='same')
-
-        # Adaptive thresholding
         median_rms = np.median(smoothed_rms)
         std_rms = np.std(smoothed_rms)
-        silence_threshold_high = median_rms + std_rms  # Adjust multiplier as needed
-        silence_threshold_low = median_rms + 0.5 * std_rms # Adjust multiplier as needed
-
-        # Hysteresis thresholding and minimum silence duration
-        min_silence_duration = 0.2  # Minimum silence duration in seconds
-        min_silence_frames = int(min_silence_duration / (hop_length / sr))
+        silence_threshold_high = median_rms + STD_RMS_MULTIPLIER_HIGH * std_rms
+        silence_threshold_low = median_rms + STD_RMS_MULTIPLIER_LOW * std_rms
+        min_silence_frames = int(MIN_SILENCE_DURATION / (hop_length / sr))
 
         end_frame = int(end / (hop_length / sr))
         silence_frames = 0
@@ -163,14 +270,15 @@ def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str
                     end = (i - min_silence_frames) * (hop_length / sr)
                     break
 
-        # Save the trimmed audio
         sf.write(audio_path, audio[:int(end * sr)], sr)
+        logger.debug(f"Trimmed audio saved: {audio_path}")
         return " ".join(seg['text'].strip() for seg in result_sample['segments'])
 
     except Exception as e:
-        print(f"Error processing {audio_path}: {e}")
+        logger.error(f"Error processing {audio_path}: {e}", exc_info=True)
         return ""
 
+# --- Audio Cutting and Saving ---
 def cut_and_save_audio(input_audio_path: str, segments: List[dict]) -> List[Segment]:
     """
     Loads audio, cuts segments based on start and end times, and saves them.
@@ -178,72 +286,90 @@ def cut_and_save_audio(input_audio_path: str, segments: List[dict]) -> List[Segm
     output_dir_name = os.path.join(output_dir, 'audio')
     os.makedirs(output_dir_name, exist_ok=True)
 
-    audio, original_sampling_rate = librosa.load(input_audio_path, sr=target_sampling_rate)
+    try:
+        audio, original_sampling_rate = librosa.load(input_audio_path, sr=TARGET_SAMPLING_RATE)
+    except Exception as e:
+        logger.error(f"Failed to load audio file {input_audio_path}: {e}", exc_info=True)
+        return []
+
     outputs = []
     output_prefix = os.path.splitext(os.path.basename(input_audio_path))[0]
 
-    for idx, segment in tqdm(enumerate(segments), desc=input_audio_path, total=len(segments), leave=False):
+    for idx, segment in tqdm(enumerate(segments), desc=f"Cutting {input_audio_path}", total=len(segments), leave=False):
         start_sample = int(segment['start'] * original_sampling_rate)
         end_sample = int(segment['end'] * original_sampling_rate)
         audio_segment = audio[start_sample:end_sample]
         output_path = os.path.join(output_dir_name, f"{output_prefix}_{idx + 1}.wav")
-        sf.write(output_path, audio_segment, target_sampling_rate)
+        sf.write(output_path, audio_segment, TARGET_SAMPLING_RATE)
+        logger.debug(f"Saved audio segment: {output_path}")
 
-        segment_text = cut_sample_to_speech_only(output_path, target_sampling_rate) # Pass target_sampling_rate
+        segment_text = cut_sample_to_speech_only(output_path, TARGET_SAMPLING_RATE)
         if segment_text:
             outputs.append(Segment(
                 text=segment_text,
                 filepath=output_path,
-                duration=librosa.get_duration(y=audio_segment, sr=target_sampling_rate)
+                duration=librosa.get_duration(y=audio_segment, sr=TARGET_SAMPLING_RATE)
             ))
         else:
+            logger.warning(f"Removing segment file due to processing error: {output_path}")
             try:
                 os.remove(output_path)
             except Exception as e:
-                print(f"Error deleting file '{output_path}': {e}")
+                logger.error(f"Error deleting file '{output_path}': {e}", exc_info=True)
 
     return outputs
 
+# --- Main Processing Function ---
 def create_segments_for_files(files_to_segment: List[str]):
     """
-    Transcribes, aligns, and segments audio files, then saves the segments.
+    Transcribes, aligns, and segments audio files sequentially, then saves the segments.
     """
     for audio_file in tqdm(sorted(files_to_segment, key=os.path.getsize, reverse=True), desc="Processing files"):
         if audio_file in files_done:
+            logger.info(f"Skipping already processed file: {audio_file}")
             continue
 
         try:
+            logger.info(f"Processing file: {audio_file}")
             audio = whisperx.load_audio(audio_file)
-            result = model.transcribe(audio, batch_size=batch_size, chunk_size=30)
-            result = whisperx.align(result["segments"], model_a, metadata, audio, device, return_char_alignments=True)
+            dynamic_chunk_size = calculate_dynamic_chunk_size(audio, TARGET_SAMPLING_RATE)
+            result = model.transcribe(audio, batch_size=BATCH_SIZE, chunk_size=dynamic_chunk_size)
+            result = whisperx.align(result["segments"], model_a, metadata, audio, DEVICE, return_char_alignments=True)
 
-            # Process segments to meet our criteria
-            refined_segments = process_segments(result)
-
-            # Continue with the rest of the processing using refined_segments
+            refined_segments = process_segments(result, audio_file, TARGET_SAMPLING_RATE)
             segment_objects = cut_and_save_audio(audio_file, refined_segments)
 
-            # Save segments to train and validation files
-            split_id = int(0.95 * len(segment_objects))
+            if not segment_objects:
+                logger.warning(f"No segments created for {audio_file}. Skipping file.")
+                continue
+
+            split_id = int(TRAIN_VALIDATION_SPLIT * len(segment_objects))
             train_segments = segment_objects[:split_id]
             validation_segments = segment_objects[split_id:]
 
             with open(os.path.join(output_dir, 'train.txt'), 'a', encoding='utf-8') as f:
                 for segment in train_segments:
                     f.write(f"{segment.filepath}|{segment.text.strip()}\n")
+            logger.debug(f"Wrote {len(train_segments)} segments to train.txt")
 
             with open(os.path.join(output_dir, 'validation.txt'), 'a', encoding='utf-8') as f:
                 for segment in validation_segments:
                     f.write(f"{segment.filepath}|{segment.text.strip()}\n")
+            logger.debug(f"Wrote {len(validation_segments)} segments to validation.txt")
 
-            # Mark file as processed
             with open(files_done_path, 'a', encoding='utf-8') as f:
                 f.write(f"{audio_file}\n")
+            logger.info(f"Finished processing: {audio_file}")
 
         except Exception as e:
-            print(f"Error processing file {audio_file}: {e}")
+            logger.error(f"Error processing file {audio_file}: {e}", exc_info=True)
 
+# --- Main Execution ---
 if __name__ == '__main__':
-    print(f"Starting run for: {run_name}")
+    logger.info(f"Starting run for: {run_name}")
     files_to_segment = glob.glob("full_audio_files/*.wav")
-    create_segments_for_files(files_to_segment)
+    if not files_to_segment:
+        logger.warning("No .wav files found in the 'full_audio_files' directory.")
+    else:
+        create_segments_for_files(files_to_segment)
+    logger.info("Audio processing complete.")
