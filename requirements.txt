@@ -1,4 +1,5 @@
-﻿faster-whisper
+faster-whisper
 numpy
 tqdm
 whisperx
+randomname
