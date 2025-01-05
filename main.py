@@ -13,22 +13,23 @@ import logging
 import torch
 
 # --- Constants ---
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"  # Device for model execution
+DEVICE = "cuda"  # Device for model execution
 BATCH_SIZE = 16  # Batch size for processing (adjust based on VRAM)
+MODEL_NAME = "small.en"  # Model name (large-v2 or small.en)
 COMPUTE_TYPE = "int8"  # Computation type (float16 or int8)
 LANGUAGE = "en"  # Language for transcription
-TARGET_SAMPLING_RATE = 48000  # Target sampling rate for audio
+TARGET_SAMPLING_RATE = 44100  # Target sampling rate for audio
 LONG_CHAR_THRESHOLD = 0.5  # Threshold to identify long pauses in speech
 FRAME_LENGTH_MS = 25  # Frame length in milliseconds for energy calculation
 HOP_LENGTH_MS = 10  # Hop length in milliseconds for energy calculation
-SMOOTHING_WINDOW_SIZE = 5  # Window size for smoothing energy
-STD_RMS_MULTIPLIER_HIGH = 1.0  # Multiplier for standard deviation of RMS energy for high threshold
-STD_RMS_MULTIPLIER_LOW = 0.5  # Multiplier for standard deviation of RMS energy for low threshold
-MIN_SILENCE_DURATION = 0.25  # Minimum silence duration in seconds
-TRAIN_VALIDATION_SPLIT = 0.95  # Percentage of data to use for training
-# RVC use 2,2,5. XTTS use 5,8,12
-MIN_SEGMENT_DURATION = 2  # Minimum duration of a segment in seconds
-OPTIMAL_SEGMENT_DURATION = 2  # Optimal duration of a segment in seconds
+SMOOTHING_WINDOW_SIZE = 8  # Increased from 5 to 8 for smoother detection
+STD_RMS_MULTIPLIER_HIGH = 1.0  # To avoid detecting short, intentional pauses within speech as silence.
+STD_RMS_MULTIPLIER_LOW = 0.25  # To ensure that only genuine periods of silence are detected, not just brief dips in volume.
+MIN_SILENCE_DURATION = 0.5  # Minimum silence duration in seconds
+TRAIN_VALIDATION_SPLIT = 0.90  # Percentage of data to use for training
+# RVC use 3,4,5. XTTS use 8,10,12
+MIN_SEGMENT_DURATION = 3  # Minimum duration of a segment in seconds
+OPTIMAL_SEGMENT_DURATION = 4  # Optimal duration of a segment in seconds
 MAX_SEGMENT_DURATION = 5  # Maximum duration of a segment in seconds
 
 # --- Logging Setup ---
@@ -57,7 +58,7 @@ logger.addHandler(console_handler)
 # --- Model Initialization ---
 logger.info("Initializing WhisperX and Alignment models...")
 try:
-    model = whisperx.load_model("small.en", DEVICE, compute_type=COMPUTE_TYPE, language=LANGUAGE)
+    model = whisperx.load_model(MODEL_NAME, DEVICE, compute_type=COMPUTE_TYPE, language=LANGUAGE)
     model_a, metadata = whisperx.load_align_model(language_code=LANGUAGE, device=DEVICE)
     logger.info("WhisperX and Alignment models initialized successfully.")
 except Exception as e:
@@ -145,6 +146,7 @@ def process_segments(result, audio_path, sr):
         'start': None,
         'end': None
     }
+    min_valid_duration = 0.5  # Minimum valid segment duration in seconds
 
     # Calculate silence segments
     audio = whisperx.load_audio(audio_path)
@@ -156,6 +158,10 @@ def process_segments(result, audio_path, sr):
     silence_segments = detect_silence_with_hysteresis(audio, sr, silence_threshold_high, silence_threshold_low, min_silence_frames)
 
     for segment in result["segments"]:
+        # Skip segments that are too short
+        if segment['end'] - segment['start'] < min_valid_duration:
+            continue
+
         if current_segment['start'] is None:
             current_segment['start'] = segment['start']
 
@@ -208,6 +214,7 @@ def process_segments(result, audio_path, sr):
     if current_segment['start'] is not None and current_segment['end'] is not None:
         final_duration = current_segment['end'] - current_segment['start']
         if final_duration >= MIN_SEGMENT_DURATION:
+            current_segment['end'] += 0.1  # Add 100ms buffer to the last segment
             refined_segments.append(current_segment)
 
     return refined_segments
@@ -230,19 +237,31 @@ def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str
             logger.warning(f"No speech segments found in {audio_path}.")
             return ""
 
-        segment = result_sample['segments'][-1]
+        end_buffer_time = 0.2  # Add 200ms buffer after last detected speech
+        min_valid_segments = 3  # Minimum number of segments to check
 
-        if not segment.get('chars'):
-            logger.warning(f"No character alignments found for the last segment in {audio_path}.")
-            end = segment['end']
-        else:
-            chars = [char for char in segment['chars'] if char.get('end') is not None and char.get('start') is not None]
-            if not chars:
-                logger.warning(f"No valid characters with 'end' and 'start' found in {audio_path}.")
-                end = segment['end']
+        # Get multiple end points and average them
+        if len(result_sample['segments']) >= min_valid_segments:
+            last_segments = result_sample['segments'][-min_valid_segments:]
+            end_times = []
+
+            for segment in last_segments:
+                if segment.get('chars'):
+                    chars = [char for char in segment['chars']
+                             if char.get('end') is not None and char.get('start') is not None]
+                    if chars:
+                        valid_end_chars = [char['end'] for char in reversed(chars)
+                                           if char.get('char', '').strip() and
+                                           (char['end'] - char['start']) < LONG_CHAR_THRESHOLD]
+                        if valid_end_chars:
+                            end_times.append(valid_end_chars[0])
+
+            if end_times:
+                end = max(end_times) + end_buffer_time
             else:
-                valid_end_chars = [char['end'] for char in reversed(chars) if char.get('char', '').strip() and (char['end'] - char['start']) < LONG_CHAR_THRESHOLD]
-                end = next(iter(valid_end_chars), chars[-1]['end'])
+                end = last_segments[-1]['end'] + end_buffer_time
+        else:
+            end = result_sample['segments'][-1]['end'] + end_buffer_time
 
         audio, sr = librosa.load(audio_path, sr=target_sampling_rate)
         frame_length = int(FRAME_LENGTH_MS / 1000 * sr)
@@ -254,21 +273,24 @@ def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str
         std_rms = np.std(smoothed_rms)
         silence_threshold_high = median_rms + STD_RMS_MULTIPLIER_HIGH * std_rms
         silence_threshold_low = median_rms + STD_RMS_MULTIPLIER_LOW * std_rms
-        min_silence_frames = int(MIN_SILENCE_DURATION / (hop_length / sr))
+        required_silence_frames = int(0.4 / (hop_length / sr))  # 400ms of consistent silence
 
         end_frame = int(end / (hop_length / sr))
-        silence_frames = 0
 
-        for i in range(end_frame, len(smoothed_rms)):
+        # Look for a longer period of consistent silence
+        for i in range(end_frame, min(len(smoothed_rms), end_frame + int(1.0 * sr / hop_length))):
             if smoothed_rms[i] < silence_threshold_high:
                 silence_frames += 1
             else:
                 silence_frames = 0
 
-            if silence_frames >= min_silence_frames:
-                if all(smoothed_rms[i - j] < silence_threshold_low for j in range(min_silence_frames)):
-                    end = (i - min_silence_frames) * (hop_length / sr)
+            if silence_frames >= required_silence_frames:
+                # Verify silence is consistent
+                if all(smoothed_rms[i - j] < silence_threshold_low for j in range(required_silence_frames)):
+                    end = (i - required_silence_frames // 2) * (hop_length / sr)
                     break
+
+        end += 0.1  # Add 100ms buffer
 
         sf.write(audio_path, audio[:int(end * sr)], sr)
         logger.debug(f"Trimmed audio saved: {audio_path}")
