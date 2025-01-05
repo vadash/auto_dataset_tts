@@ -12,6 +12,8 @@ from typing import List
 import logging
 import torch
 
+# Prep audio with de-ess and trim silence (0.5+ s -> 0.5 s, -40 db)
+
 # --- Constants ---
 DEVICE = "cuda"  # Device for model execution
 BATCH_SIZE = 16  # Batch size for processing (adjust based on VRAM)
@@ -214,7 +216,6 @@ def process_segments(result, audio_path, sr):
     if current_segment['start'] is not None and current_segment['end'] is not None:
         final_duration = current_segment['end'] - current_segment['start']
         if final_duration >= MIN_SEGMENT_DURATION:
-            current_segment['end'] += 0.1  # Add 100ms buffer to the last segment
             refined_segments.append(current_segment)
 
     return refined_segments
@@ -278,6 +279,7 @@ def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str
         end_frame = int(end / (hop_length / sr))
 
         # Look for a longer period of consistent silence
+        silence_frames = 0
         for i in range(end_frame, min(len(smoothed_rms), end_frame + int(1.0 * sr / hop_length))):
             if smoothed_rms[i] < silence_threshold_high:
                 silence_frames += 1
@@ -289,8 +291,6 @@ def cut_sample_to_speech_only(audio_path: str, target_sampling_rate: int) -> str
                 if all(smoothed_rms[i - j] < silence_threshold_low for j in range(required_silence_frames)):
                     end = (i - required_silence_frames // 2) * (hop_length / sr)
                     break
-
-        end += 0.1  # Add 100ms buffer
 
         sf.write(audio_path, audio[:int(end * sr)], sr)
         logger.debug(f"Trimmed audio saved: {audio_path}")
